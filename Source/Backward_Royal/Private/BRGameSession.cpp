@@ -1,0 +1,683 @@
+// BRGameSession.cpp - NGDA 스타일 Steam OSS 구현
+#include "BRGameSession.h"
+#include "BRGameInstance.h"
+#include "BRGameMode.h"
+#include "OnlineSubsystem.h"
+#include "OnlineSessionSettings.h"
+#include "Interfaces/OnlineSessionInterface.h"
+#include "Engine/Engine.h"
+#include "Engine/World.h"
+#include "GameFramework/PlayerController.h"
+#include "Kismet/GameplayStatics.h"
+#include "Misc/Paths.h"
+
+ABRGameSession::ABRGameSession()
+	: bIsSearchingSessions(false)
+	, FindSessionsRetryCount(0)
+	, PendingRoomName(TEXT(""))
+	, bPendingCreateSession(false)
+{
+}
+
+void ABRGameSession::BeginPlay()
+{
+	Super::BeginPlay();
+	
+	// Online Subsystem 초기화
+	InitializeOnlineSubsystem();
+	
+	// PendingRoomName이 있으면 자동 방 생성
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+	
+	UBRGameInstance* BRGI = Cast<UBRGameInstance>(World->GetGameInstance());
+	if (!BRGI)
+	{
+		return;
+	}
+	
+	FString RoomName = BRGI->GetPendingRoomName();
+	if (RoomName.IsEmpty() || HasActiveSession())
+	{
+		return;
+	}
+	
+	UE_LOG(LogTemp, Warning, TEXT("[GameSession] PendingRoomName 발견: %s"), *RoomName);
+	
+	// Online Subsystem이 준비될 때까지 대기 후 방 생성
+	// 람다에서 World를 캡처하지 않고 콜백 시점에 GetWorld()로 가져와 댕글링 포인터 크래시 방지
+	// 멤버 핸들 사용: PIE 종료 시 EndPlay/UnbindSessionDelegatesForPIEExit에서 클리어해 월드 참조 잔류 방지
+	FString RoomNameCopy = RoomName; // 복사본 저장
+	World->GetTimerManager().SetTimer(PendingCreateRoomTimerHandle, [this, RoomNameCopy]()
+	{
+		if (!IsValid(this))
+		{
+			UE_LOG(LogTemp, Error, TEXT("[GameSession] 타이머 콜백: GameSession이 유효하지 않습니다."));
+			return;
+		}
+		
+		UWorld* CurrentWorld = GetWorld();
+		if (!CurrentWorld || !IsValid(CurrentWorld))
+		{
+			UE_LOG(LogTemp, Error, TEXT("[GameSession] 타이머 콜백: GetWorld()가 유효하지 않습니다."));
+			return;
+		}
+		
+		// SessionInterface가 준비되었는지 확인
+		if (!SessionInterface.IsValid())
+		{
+			InitializeOnlineSubsystem();
+		}
+		
+		// SessionInterface가 준비되었고 세션이 없으면 방 생성
+		if (SessionInterface.IsValid() && !HasActiveSession())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[GameSession] 자동 방 생성 실행: %s"), *RoomNameCopy);
+			CreateRoomSession(RoomNameCopy);
+			if (UBRGameInstance* GI = Cast<UBRGameInstance>(CurrentWorld->GetGameInstance()))
+			{
+				GI->ClearPendingRoomName();
+			}
+		}
+	}, 1.0f, false); // 1초 지연 (Online Subsystem 초기화 대기)
+}
+
+void ABRGameSession::InitializeOnlineSubsystem()
+{
+	if (!IsValid(this) || !GetWorld())
+	{
+		return;
+	}
+	
+	// NGDA 스타일: 간단하게 Online Subsystem 가져오기
+	IOnlineSubsystem* OnlineSubsystem = IOnlineSubsystem::Get();
+	if (!OnlineSubsystem)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[GameSession] Online Subsystem 초기화 실패"));
+		return;
+	}
+	
+	FString SubsystemName = OnlineSubsystem->GetSubsystemName().ToString();
+	UE_LOG(LogTemp, Warning, TEXT("[GameSession] Online Subsystem: %s"), *SubsystemName);
+	
+	// SessionInterface 가져오기
+	SessionInterface = OnlineSubsystem->GetSessionInterface();
+	if (SessionInterface.IsValid())
+	{
+		// 콜백 바인딩 (중복 방지 - 이미 바인딩되어 있으면 스킵)
+		if (!SessionInterface->OnCreateSessionCompleteDelegates.IsBoundToObject(this))
+		{
+			SessionInterface->OnCreateSessionCompleteDelegates.AddUObject(this, &ABRGameSession::OnCreateSessionCompleteDelegate);
+			SessionInterface->OnStartSessionCompleteDelegates.AddUObject(this, &ABRGameSession::OnStartSessionCompleteDelegate);
+			SessionInterface->OnDestroySessionCompleteDelegates.AddUObject(this, &ABRGameSession::OnDestroySessionCompleteDelegate);
+			SessionInterface->OnFindSessionsCompleteDelegates.AddUObject(this, &ABRGameSession::OnFindSessionsCompleteDelegate);
+			SessionInterface->OnJoinSessionCompleteDelegates.AddUObject(this, &ABRGameSession::OnJoinSessionCompleteDelegate);
+			UE_LOG(LogTemp, Warning, TEXT("[GameSession] SessionInterface 콜백 바인딩 완료"));
+		}
+		UE_LOG(LogTemp, Warning, TEXT("[GameSession] SessionInterface 초기화 완료"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[GameSession] SessionInterface 초기화 실패"));
+	}
+}
+
+void ABRGameSession::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	Super::EndPlay(EndPlayReason);
+	
+	// 콜백 해제
+	if (SessionInterface.IsValid())
+	{
+		SessionInterface->OnCreateSessionCompleteDelegates.RemoveAll(this);
+		SessionInterface->OnStartSessionCompleteDelegates.RemoveAll(this);
+		SessionInterface->OnDestroySessionCompleteDelegates.RemoveAll(this);
+		SessionInterface->OnFindSessionsCompleteDelegates.RemoveAll(this);
+		SessionInterface->OnJoinSessionCompleteDelegates.RemoveAll(this);
+	}
+	
+	// 검색 중이면 취소
+	if (bIsSearchingSessions && SessionInterface.IsValid())
+	{
+		SessionInterface->CancelFindSessions();
+		bIsSearchingSessions = false;
+	}
+	
+	// 타이머 정리
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(FindSessionsRetryHandle);
+		World->GetTimerManager().ClearTimer(PendingCreateRoomTimerHandle);
+	}
+}
+
+void ABRGameSession::UnbindSessionDelegatesForPIEExit()
+{
+	// SessionInterface가 GameSession(this)을 붙들고 있으면 UnrealEdEngine → OSS → SessionInterface → GameSession → World 참조 사슬로
+	// PIE 월드가 GC되지 않는다. PIE 종료 시 GameInstance::Shutdown에서 먼저 호출해 이 사슬을 끊는다.
+	if (SessionInterface.IsValid())
+	{
+		SessionInterface->OnCreateSessionCompleteDelegates.RemoveAll(this);
+		SessionInterface->OnStartSessionCompleteDelegates.RemoveAll(this);
+		SessionInterface->OnDestroySessionCompleteDelegates.RemoveAll(this);
+		SessionInterface->OnFindSessionsCompleteDelegates.RemoveAll(this);
+		SessionInterface->OnJoinSessionCompleteDelegates.RemoveAll(this);
+	}
+	if (bIsSearchingSessions && SessionInterface.IsValid())
+	{
+		SessionInterface->CancelFindSessions();
+		bIsSearchingSessions = false;
+	}
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(FindSessionsRetryHandle);
+		World->GetTimerManager().ClearTimer(PendingCreateRoomTimerHandle);
+		World->GetTimerManager().ClearAllTimersForObject(this);
+	}
+}
+
+FString ABRGameSession::BuildTravelURL() const
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return FString();
+	}
+	
+	// NGDA 스타일: 로비 맵이 지정돼 있으면 그 맵으로, 없으면 현재 맵 유지
+	if (ABRGameMode* GM = World->GetAuthGameMode<ABRGameMode>())
+	{
+		if (!GM->LobbyMapPath.IsEmpty())
+		{
+			return GM->LobbyMapPath + TEXT("?listen");
+		}
+	}
+	
+	// 현재 맵 경로로 리슨 URL 구성 (BRCheatManager와 동일한 방식)
+	FString MapPath = UGameplayStatics::GetCurrentLevelName(World, true);
+	if (MapPath.IsEmpty())
+	{
+		MapPath = World->GetMapName();
+		MapPath.RemoveFromStart(World->StreamingLevelsPrefix);
+	}
+	
+	// 맵 경로가 비어있으면 기본값 사용
+	if (MapPath.IsEmpty())
+	{
+		MapPath = TEXT("/Game/Main/Level/Main_Scene");
+	}
+	
+	// /Game/.../MapName 형식으로 변환 (이미 올바른 형식이면 그대로 사용)
+	if (!MapPath.Contains(TEXT("/")))
+	{
+		// 짧은 이름만 있으면 전체 경로로 변환
+		MapPath = FString::Printf(TEXT("/Game/Main/Level/%s"), *MapPath);
+	}
+	
+	// .MapName 형식이 아니면 추가
+	if (!MapPath.Contains(TEXT(".")))
+	{
+		FString BaseName = FPaths::GetBaseFilename(MapPath);
+		MapPath = FString::Printf(TEXT("%s.%s"), *MapPath, *BaseName);
+	}
+	
+	return MapPath + TEXT("?listen");
+}
+
+void ABRGameSession::CreateRoomSession(const FString& RoomName)
+{
+	UE_LOG(LogTemp, Warning, TEXT("[방 생성] 시작: %s"), *RoomName);
+	
+	if (!SessionInterface.IsValid())
+	{
+		InitializeOnlineSubsystem();
+		if (!SessionInterface.IsValid())
+		{
+			UE_LOG(LogTemp, Error, TEXT("[방 생성] SessionInterface 초기화 실패"));
+			OnCreateSessionComplete.Broadcast(false);
+			return;
+		}
+	}
+	
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		OnCreateSessionComplete.Broadcast(false);
+		return;
+	}
+	
+	// Standalone 모드에서는 CreateSession 전에 ListenServer로 전환 필요
+	ENetMode NetMode = World->GetNetMode();
+	UE_LOG(LogTemp, Warning, TEXT("[방 생성] 현재 NetMode: %s"), 
+		NetMode == NM_Standalone ? TEXT("Standalone") :
+		NetMode == NM_ListenServer ? TEXT("ListenServer") :
+		NetMode == NM_Client ? TEXT("Client") :
+		NetMode == NM_DedicatedServer ? TEXT("DedicatedServer") : TEXT("Unknown"));
+	
+	if (NetMode == NM_Standalone)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[방 생성] ⚠️ Standalone 모드 감지 - ListenServer로 전환 후 세션 생성"));
+		
+		// 현재 맵 경로 가져오기
+		FString CurrentMapPath = UGameplayStatics::GetCurrentLevelName(World, true);
+		if (CurrentMapPath.IsEmpty())
+		{
+			CurrentMapPath = World->GetMapName();
+			CurrentMapPath.RemoveFromStart(World->StreamingLevelsPrefix);
+		}
+		
+		// 맵 경로를 /Game/.../MapName.MapName 형식으로 변환
+		if (!CurrentMapPath.Contains(TEXT("/")))
+		{
+			CurrentMapPath = FString::Printf(TEXT("/Game/Main/Level/%s.%s"), *CurrentMapPath, *CurrentMapPath);
+		}
+		else if (!CurrentMapPath.Contains(TEXT(".")))
+		{
+			FString MapName = FPaths::GetBaseFilename(CurrentMapPath);
+			CurrentMapPath = FString::Printf(TEXT("%s.%s"), *CurrentMapPath, *MapName);
+		}
+		
+		if (!CurrentMapPath.IsEmpty())
+		{
+			FString ListenURL = FString::Printf(TEXT("%s?listen"), *CurrentMapPath);
+			FString OpenCommand = FString::Printf(TEXT("open %s"), *ListenURL);
+			
+			// PendingRoomName 저장 (ListenServer 전환 후 자동 방 생성용)
+			if (UBRGameInstance* BRGI = Cast<UBRGameInstance>(World->GetGameInstance()))
+			{
+				BRGI->SetPendingRoomName(RoomName);
+			}
+			
+			// ListenServer로 전환
+			if (GEngine)
+			{
+				bool bExecResult = GEngine->Exec(World, *OpenCommand);
+				UE_LOG(LogTemp, Warning, TEXT("[방 생성] Standalone → ListenServer 전환: %s, 명령: %s"), 
+					bExecResult ? TEXT("성공") : TEXT("실패"), *OpenCommand);
+			}
+			
+			// ListenServer 전환 후 자동으로 방 생성됨 (OnStart에서 PendingRoomName 처리)
+			return;
+		}
+	}
+	
+	// 기존 세션이 있으면 제거
+	auto ExistingSession = SessionInterface->GetNamedSession(NAME_GameSession);
+	if (ExistingSession != nullptr)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[방 생성] 기존 세션 제거 중..."));
+		PendingRoomName = RoomName;
+		bPendingCreateSession = true;
+		SessionInterface->DestroySession(NAME_GameSession);
+		return;
+	}
+	
+	// NGDA 스타일: 세션 설정 생성
+	SessionSettings = MakeShareable(new FOnlineSessionSettings());
+	
+	IOnlineSubsystem* OnlineSubsystem = IOnlineSubsystem::Get();
+	FString SubsystemName = OnlineSubsystem ? OnlineSubsystem->GetSubsystemName().ToString() : TEXT("NULL");
+	
+	// NGDA 스타일: 세션 설정
+	SessionSettings->bIsLANMatch = (SubsystemName == TEXT("NULL"));
+	SessionSettings->bUsesPresence = true;
+	SessionSettings->bShouldAdvertise = true;
+	SessionSettings->bUseLobbiesIfAvailable = true;
+	SessionSettings->bAllowJoinViaPresence = true;
+	SessionSettings->bAllowJoinInProgress = true;
+
+	// NGDA 스타일: CreateSession 성공 후 StartSession → ServerTravel(TravelURL)용 URL
+	TravelURL = BuildTravelURL();
+
+	// 플레이어 수 설정
+	int32 MaxPlayerCount = 8;
+	if (ABRGameMode* BRGM = World->GetAuthGameMode<ABRGameMode>())
+	{
+		MaxPlayerCount = BRGM->MaxPlayers;
+	}
+	SessionSettings->NumPublicConnections = MaxPlayerCount;
+	
+	// 세션 이름 설정
+	FString SessionNameStr = RoomName.IsEmpty() ? TEXT("이름 없는 방") : RoomName;
+	SessionSettings->Set(FName(TEXT("SESSION_NAME")), SessionNameStr, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
+	
+	// NGDA 스타일: CreateSession 호출 (NetMode 체크 없음 - Steam OSS가 자동으로 ListenServer 처리)
+	int32 LocalUserNum = 0;
+	bool bCreateResult = SessionInterface->CreateSession(LocalUserNum, NAME_GameSession, *SessionSettings);
+	
+	if (!bCreateResult)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[방 생성] CreateSession 호출 실패"));
+		OnCreateSessionComplete.Broadcast(false);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[방 생성] CreateSession 호출 성공 (비동기 처리 중)"));
+	}
+}
+
+void ABRGameSession::FindSessions()
+{
+	UE_LOG(LogTemp, Warning, TEXT("[방 찾기] 시작"));
+	
+	if (!SessionInterface.IsValid())
+	{
+		UE_LOG(LogTemp, Error, TEXT("[방 찾기] SessionInterface가 유효하지 않습니다."));
+		OnFindSessionsComplete.Broadcast(TArray<FOnlineSessionSearchResult>());
+		OnFindSessionsCompleteBP.Broadcast(0);
+		return;
+	}
+	
+	// 이미 검색 중이면 무시
+	if (bIsSearchingSessions)
+	{
+		return;
+	}
+	
+	FindSessionsInternal(false);
+}
+
+void ABRGameSession::FindSessionsRetryCallback()
+{
+	FindSessionsInternal(true);
+}
+
+void ABRGameSession::FindSessionsInternal(bool bIsRetry)
+{
+	if (!SessionInterface.IsValid())
+	{
+		return;
+	}
+	
+	if (!bIsRetry)
+	{
+		FindSessionsRetryCount = 0;
+		if (UWorld* World = GetWorld())
+		{
+			World->GetTimerManager().ClearTimer(FindSessionsRetryHandle);
+		}
+	}
+	
+	bIsSearchingSessions = true;
+	
+	// 이전 검색 취소
+	SessionInterface->CancelFindSessions();
+	
+	// 세션 검색 설정
+	SessionSearch = MakeShareable(new FOnlineSessionSearch());
+	SessionSearch->MaxSearchResults = 100;
+	SessionSearch->QuerySettings.Set(FName(TEXT("PRESENCESEARCH")), true, EOnlineComparisonOp::Equals);
+	
+	// LAN 여부 설정
+	IOnlineSubsystem* OnlineSubsystem = IOnlineSubsystem::Get();
+	if (OnlineSubsystem && OnlineSubsystem->GetSubsystemName() == "NULL")
+	{
+		SessionSearch->bIsLanQuery = true;
+	}
+	else
+	{
+		SessionSearch->bIsLanQuery = false;
+	}
+	
+	// FindSessions 호출
+	bool bFindSessionsResult = SessionInterface->FindSessions(0, SessionSearch.ToSharedRef());
+	if (!bFindSessionsResult)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[방 찾기] FindSessions 호출 실패"));
+		bIsSearchingSessions = false;
+		OnFindSessionsComplete.Broadcast(TArray<FOnlineSessionSearchResult>());
+		OnFindSessionsCompleteBP.Broadcast(0);
+	}
+}
+
+void ABRGameSession::JoinSessionByIndex(int32 SessionIndex)
+{
+	if (!SessionInterface.IsValid())
+	{
+		UE_LOG(LogTemp, Error, TEXT("[방 참가] SessionInterface가 유효하지 않습니다."));
+		OnJoinSessionComplete.Broadcast(false);
+		return;
+	}
+	
+	if (!SessionSearch.IsValid() || SessionIndex < 0 || SessionIndex >= SessionSearch->SearchResults.Num())
+	{
+		UE_LOG(LogTemp, Error, TEXT("[방 참가] 잘못된 세션 인덱스: %d"), SessionIndex);
+		OnJoinSessionComplete.Broadcast(false);
+		return;
+	}
+	
+	const FOnlineSessionSearchResult& SessionResult = SessionSearch->SearchResults[SessionIndex];
+	JoinSession(SessionResult);
+}
+
+void ABRGameSession::JoinSession(const FOnlineSessionSearchResult& SessionResult)
+{
+	if (!SessionInterface.IsValid())
+	{
+		UE_LOG(LogTemp, Error, TEXT("[방 참가] SessionInterface가 유효하지 않습니다."));
+		OnJoinSessionComplete.Broadcast(false);
+		return;
+	}
+	
+	// 기존 세션이 있으면 제거
+	auto ExistingSession = SessionInterface->GetNamedSession(NAME_GameSession);
+	if (ExistingSession != nullptr)
+	{
+		SessionInterface->DestroySession(NAME_GameSession);
+	}
+	
+	// JoinSession 호출
+	SessionInterface->JoinSession(0, NAME_GameSession, SessionResult);
+}
+
+void ABRGameSession::OnCreateSessionCompleteDelegate(FName InSessionName, bool bWasSuccessful)
+{
+	if (bWasSuccessful)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[방 생성] 성공! StartSession 후 ServerTravel 예정..."));
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Green,
+				TEXT("[방 생성] 성공! 리슨 서버로 전환 중..."));
+		}
+		// NGDA 스타일: CreateSession 성공 후 반드시 StartSession 호출 → OnStartSessionComplete에서 ServerTravel
+		if (SessionInterface.IsValid())
+		{
+			SessionInterface->StartSession(InSessionName);
+		}
+		else
+		{
+			OnCreateSessionComplete.Broadcast(false);
+			return;
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[방 생성] 실패"));
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red, TEXT("[방 생성] 실패"));
+		}
+		OnCreateSessionComplete.Broadcast(false);
+	}
+}
+
+void ABRGameSession::OnStartSessionCompleteDelegate(FName InSessionName, bool bWasSuccessful)
+{
+	if (bWasSuccessful)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[방 생성] StartSession 성공. ServerTravel: %s"), *TravelURL);
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Green,
+				FString::Printf(TEXT("세션 시작 완료! 맵 이동: %s"), *TravelURL));
+		}
+		UWorld* World = GetWorld();
+		if (World && !TravelURL.IsEmpty())
+		{
+			// PIE(Play In Editor) 환경 감지
+			bool bIsPIE = World->IsPlayInEditor();
+			
+			if (bIsPIE)
+			{
+				// PIE에서는 ServerTravel을 스킵 (크래시 방지)
+				// PIE에서는 현재 맵에서 세션만 활성화
+				UE_LOG(LogTemp, Warning, TEXT("[방 생성] PIE 모드 감지 - ServerTravel 스킵 (현재 맵에서 세션 활성화)"));
+				if (GEngine)
+				{
+					GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Cyan,
+						TEXT("PIE 모드: 현재 맵에서 세션이 활성화되었습니다."));
+				}
+			}
+			else
+			{
+				// 일반 실행 환경에서는 ServerTravel 실행
+				World->ServerTravel(TravelURL, true);
+				UE_LOG(LogTemp, Warning, TEXT("[방 생성] ServerTravel 호출 완료. 맵 재로드 후 ListenServer 모드로 전환됩니다."));
+				if (GEngine)
+				{
+					GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Yellow,
+						TEXT("맵 재로드 중... 리슨 서버로 전환됩니다."));
+				}
+			}
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("[방 생성] ServerTravel 스킵: World 또는 TravelURL 없음"));
+		}
+		OnCreateSessionComplete.Broadcast(true);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[방 생성] StartSession 실패"));
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red, TEXT("[방 생성] StartSession 실패"));
+		}
+		OnCreateSessionComplete.Broadcast(false);
+	}
+}
+
+void ABRGameSession::OnDestroySessionCompleteDelegate(FName InSessionName, bool bWasSuccessful)
+{
+	UE_LOG(LogTemp, Warning, TEXT("[방 생성] 세션 제거 완료: %s"), bWasSuccessful ? TEXT("성공") : TEXT("실패"));
+	
+	if (bPendingCreateSession && !PendingRoomName.IsEmpty())
+	{
+		bPendingCreateSession = false;
+		FString RoomName = PendingRoomName;
+		PendingRoomName = TEXT("");
+		CreateRoomSession(RoomName);
+	}
+}
+
+void ABRGameSession::OnFindSessionsCompleteDelegate(bool bWasSuccessful)
+{
+	bIsSearchingSessions = false;
+	
+	TArray<FOnlineSessionSearchResult> Results;
+	
+	if (bWasSuccessful && SessionSearch.IsValid())
+	{
+		Results = SessionSearch->SearchResults;
+		UE_LOG(LogTemp, Warning, TEXT("[방 찾기] 완료: %d개 세션 발견"), Results.Num());
+		
+		// 0건일 때 Steam이면 최대 2회 자동 재검색
+		if (Results.Num() == 0)
+		{
+			IOnlineSubsystem* OnlineSubsystem = IOnlineSubsystem::Get();
+			FString SubsystemName = OnlineSubsystem ? OnlineSubsystem->GetSubsystemName().ToString() : TEXT("NULL");
+			
+			if (SubsystemName.Equals(TEXT("Steam"), ESearchCase::IgnoreCase) &&
+				FindSessionsRetryCount < MaxFindSessionsRetries)
+			{
+				FindSessionsRetryCount++;
+				UE_LOG(LogTemp, Warning, TEXT("[방 찾기] 세션 0건. 2초 후 재검색 (%d/%d)"), FindSessionsRetryCount, MaxFindSessionsRetries);
+				if (UWorld* World = GetWorld())
+				{
+					World->GetTimerManager().SetTimer(FindSessionsRetryHandle, this, &ABRGameSession::FindSessionsRetryCallback, 2.0f, false);
+				}
+				return;
+			}
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[방 찾기] 실패"));
+	}
+	
+	OnFindSessionsComplete.Broadcast(Results);
+	OnFindSessionsCompleteBP.Broadcast(Results.Num());
+}
+
+void ABRGameSession::OnJoinSessionCompleteDelegate(FName InSessionName, EOnJoinSessionCompleteResult::Type Result)
+{
+	bool bWasSuccessful = (Result == EOnJoinSessionCompleteResult::Success);
+	
+	if (!SessionInterface.IsValid())
+	{
+		OnJoinSessionComplete.Broadcast(false);
+		return;
+	}
+	
+	// 연결 문자열 가져오기
+	FString ConnectURL;
+	if (!SessionInterface->GetResolvedConnectString(InSessionName, ConnectURL))
+	{
+		UE_LOG(LogTemp, Error, TEXT("[방 참가] 연결 주소를 가져올 수 없습니다."));
+		OnJoinSessionComplete.Broadcast(false);
+		return;
+	}
+	
+	// ClientTravel 호출
+	if (UWorld* World = GetWorld())
+	{
+		if (APlayerController* PC = World->GetFirstPlayerController())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[방 참가] 서버로 이동: %s"), *ConnectURL);
+			PC->ClientTravel(ConnectURL, ETravelType::TRAVEL_Absolute);
+		}
+	}
+	
+	OnJoinSessionComplete.Broadcast(bWasSuccessful);
+}
+
+int32 ABRGameSession::GetSessionCount() const
+{
+	if (SessionSearch.IsValid())
+	{
+		return SessionSearch->SearchResults.Num();
+	}
+	return 0;
+}
+
+FString ABRGameSession::GetSessionName(int32 SessionIndex) const
+{
+	if (!SessionSearch.IsValid() || SessionIndex < 0 || SessionIndex >= SessionSearch->SearchResults.Num())
+	{
+		return FString();
+	}
+	
+	const FOnlineSessionSearchResult& Result = SessionSearch->SearchResults[SessionIndex];
+	FString FoundSessionName;
+	Result.Session.SessionSettings.Get(FName(TEXT("SESSION_NAME")), FoundSessionName);
+	
+	if (!FoundSessionName.IsEmpty())
+	{
+		return FoundSessionName;
+	}
+	return TEXT("(이름 없음)");
+}
+
+bool ABRGameSession::HasActiveSession() const
+{
+	if (SessionInterface.IsValid())
+	{
+		auto Session = SessionInterface->GetNamedSession(NAME_GameSession);
+		return Session != nullptr;
+	}
+	return false;
+}
