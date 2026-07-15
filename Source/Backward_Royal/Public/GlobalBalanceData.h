@@ -20,6 +20,9 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
     float Global_Weapon_AttackSpeedMultiplier = 1.0f;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+    float Global_Durability_Reduction = 10.f;
+
     // --- 스태미나 관련 설정 ---
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
     float Global_Stamina_SprintDrainRate = 20.0f;
@@ -29,4 +32,18 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
     float Global_Stamina_RegenRate = 10.0f;
+
+    // --- 맨손 공격 관련 설정 ---
+    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+    float Global_BasePunchDamage = 10.0f;
+
+    // --- 플레이어 이동(관성) 관련 설정 ---
+    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+    float Global_Player_RotationRateYaw = 300.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+    float Global_Player_BrakingFriction = 1.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+    float Global_Player_BrakingDecelerationWalking = 500.0f;
 };

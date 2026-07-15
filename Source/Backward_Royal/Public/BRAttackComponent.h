@@ -14,6 +14,8 @@ class BACKWARD_ROYAL_API UBRAttackComponent : public UActorComponent
 public:
 	UBRAttackComponent();
 
+	static float Global_BasePunchDamage;
+
 protected:
 	virtual void BeginPlay() override;
 
@@ -43,11 +45,29 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Combat|Settings")
 	float StandardMass = 10.0f;
 
+	// 히트 스탑(역경직) 적용 함수
+	void ApplyHitStop(float Duration);
+
+	// 서버에서 모든 클라이언트로 히트 스탑 명령 전송
+	UFUNCTION(NetMulticast, Reliable)
+	void MulticastApplyHitStop(float Duration);
+	
+	// [신규] 멀티플레이어 타격음 재생용 함수
+	UFUNCTION(NetMulticast, Unreliable)
+	void MulticastPlayHitSound(USoundBase* SoundToPlay, FVector Location, float Volume);
+
+
 private:
 	bool bIsDetectionActive = false;
 
 	UPROPERTY()
 	TArray<AActor*> HitActors;
+
+	// 히트 스탑 타이머 핸들
+	FTimerHandle HitStopTimerHandle;
+
+	// 히트 스탑 해제 및 애니메이션 종료 함수
+	void ResetHitStop();
 
 #define ATK_LOG(Verbosity, Format, ...) UE_LOG(LogAttackComp, Verbosity, TEXT("%s: ") Format, *GetOwner()->GetName(), ##__VA_ARGS__)
 };

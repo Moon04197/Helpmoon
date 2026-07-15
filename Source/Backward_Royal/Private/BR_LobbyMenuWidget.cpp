@@ -1,10 +1,15 @@
 // BR_LobbyMenuWidget.cpp
 #include "BR_LobbyMenuWidget.h"
+#include "BR_LobbyTeamSlotDisplayInterface.h"
 #include "BRPlayerController.h"
 #include "BRGameState.h"
 #include "BRPlayerState.h"
+#include "BRWidgetFunctionLibrary.h"
+#include "Blueprint/WidgetTree.h"
 #include "Engine/World.h"
 #include "Kismet/GameplayStatics.h"
+#include "Components/Widget.h"
+#include <functional>
 
 UBR_LobbyMenuWidget::UBR_LobbyMenuWidget(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
@@ -30,16 +35,37 @@ void UBR_LobbyMenuWidget::NativeConstruct()
 		// 초기 게임 시작 가능 여부 확인
 		HandleCanStartGameChanged();
 	}
+
+	// 늦게 들어온 클라이언트 대응: 구독 시점에 이미 지나간 OnRep를 놓쳤을 수 있으므로
+	// 현재 GameState 기준으로 즉시 한 번 갱신
+	HandlePlayerListChanged();
+
+	// 복제가 0.45초 타이머보다 늦게 도착하는 경우를 위해, 짧은 지연 후 한 번 더 갱신
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().SetTimer(LateJoinerRefreshTimerHandle, this, &UBR_LobbyMenuWidget::HandlePlayerListChanged, 0.6f, false);
+	}
+
+	// 초기 방 제목 표시 (HandlePlayerListChanged에서도 호출되지만, 위에서 이미 한 번 호출함)
+	FString RoomTitle = UBRWidgetFunctionLibrary::GetRoomTitleForDisplay(this);
+	OnRoomTitleRefreshed(RoomTitle);
 }
 
 void UBR_LobbyMenuWidget::NativeDestruct()
 {
+	// 지연 갱신 타이머 해제
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(LateJoinerRefreshTimerHandle);
+	}
 	// 이벤트 바인딩 해제
 	if (CachedGameState)
 	{
 		CachedGameState->OnPlayerListChanged.RemoveDynamic(this, &UBR_LobbyMenuWidget::HandlePlayerListChanged);
 		CachedGameState->OnTeamChanged.RemoveDynamic(this, &UBR_LobbyMenuWidget::HandleTeamChanged);
+		CachedGameState = nullptr;
 	}
+	CachedPlayerController = nullptr;
 
 	Super::NativeDestruct();
 }
@@ -188,17 +214,51 @@ void UBR_LobbyMenuWidget::SetMyPlayerRole(int32 PlayerIndex)
 {
 	if (ABRPlayerController* BRPC = GetBRPlayerController())
 	{
-		// PlayerIndex: 0=하체, 1=상체
-		if (PlayerIndex == 0 || PlayerIndex == 1)
+		// PlayerIndex: 0=관전, 1=하체, 2=상체
+		if (PlayerIndex == 0)
 		{
-			bool bLowerBody = (PlayerIndex == 0);
+			// 관전: 현재 팀의 관전 슬롯으로 이동 (현재 팀 번호 필요)
+			ABRPlayerState* BRPS = BRPC->GetPlayerState<ABRPlayerState>();
+			if (BRPS && BRPS->TeamNumber >= 1 && BRPS->TeamNumber <= 4)
+			{
+				const int32 TeamIndex = BRPS->TeamNumber - 1;
+				BRPC->RequestAssignToLobbyTeam(TeamIndex, 0);
+				UE_LOG(LogTemp, Log, TEXT("[LobbyMenu] 플레이어 역할 설정: 관전 (PlayerIndex=0)"));
+			}
+		}
+		else if (PlayerIndex == 1 || PlayerIndex == 2)
+		{
+			bool bLowerBody = (PlayerIndex == 1);
 			FString RoleName = bLowerBody ? TEXT("하체") : TEXT("상체");
 			UE_LOG(LogTemp, Log, TEXT("[LobbyMenu] 플레이어 역할 설정: %s (PlayerIndex=%d)"), *RoleName, PlayerIndex);
 			BRPC->SetMyPlayerRole(bLowerBody);
 		}
 		else
 		{
-			UE_LOG(LogTemp, Warning, TEXT("[LobbyMenu] 잘못된 PlayerIndex: %d (0=하체, 1=상체)"), PlayerIndex);
+			UE_LOG(LogTemp, Warning, TEXT("[LobbyMenu] 잘못된 PlayerIndex: %d (0=관전, 1=하체, 2=상체)"), PlayerIndex);
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[LobbyMenu] PlayerController를 찾을 수 없습니다."));
+	}
+}
+
+void UBR_LobbyMenuWidget::AssignMyPlayerToTeamSlot(int32 TeamID, int32 PlayerIndex)
+{
+	if (ABRPlayerController* BRPC = GetBRPlayerController())
+	{
+		// TeamID 1~4, PlayerIndex 0=관전, 1=1P(하체), 2=2P(상체) → 내부 SlotIndex 0/1/2
+		if (TeamID >= 1 && TeamID <= 4 && PlayerIndex >= 0 && PlayerIndex <= 2)
+		{
+			const int32 TeamIndex = TeamID - 1;
+			UE_LOG(LogTemp, Log, TEXT("[LobbyMenu] 팀 슬롯 선택: TeamID=%d, PlayerIndex=%d (%s)"), TeamID, PlayerIndex,
+				PlayerIndex == 0 ? TEXT("관전") : (PlayerIndex == 1 ? TEXT("1P") : TEXT("2P")));
+			BRPC->RequestAssignToLobbyTeam(TeamIndex, PlayerIndex);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[LobbyMenu] 잘못된 값: TeamID=%d (1~4), PlayerIndex=%d (0=관전, 1=1P, 2=2P)"), TeamID, PlayerIndex);
 		}
 	}
 	else
@@ -209,6 +269,55 @@ void UBR_LobbyMenuWidget::SetMyPlayerRole(int32 PlayerIndex)
 
 void UBR_LobbyMenuWidget::HandlePlayerListChanged()
 {
+	// 팀 슬롯(1P/2P) 자동 갱신: 인터페이스 구현체 찾아서 UpdateSlotDisplay 호출.
+	// 중첩된 UserWidget 트리까지 재귀 검색 (WBP_SelectTeam이 컨테이너 안에 있으면 그 안까지 찾음).
+	TArray<UUserWidget*> Visited;
+	TArray<UWidgetTree*> TreesToProcess;
+	TreesToProcess.Add(WidgetTree);
+
+	// 부모 위젯 트리도 추가 (WBP_SelectTeam이 형제 위젯일 수 있음)
+	for (UWidget* Ancestor = GetParent(); Ancestor; Ancestor = Ancestor->GetParent())
+	{
+		UUserWidget* ParentUserWidget = Cast<UUserWidget>(Ancestor);
+		if (ParentUserWidget && ParentUserWidget->WidgetTree)
+		{
+			TreesToProcess.Add(ParentUserWidget->WidgetTree);
+			break;
+		}
+	}
+
+	while (TreesToProcess.Num() > 0)
+	{
+		UWidgetTree* Tree = TreesToProcess.Pop();
+		if (!Tree) continue;
+
+		TArray<UWidget*> AllWidgets;
+		Tree->GetAllWidgets(AllWidgets);
+		for (UWidget* Widget : AllWidgets)
+		{
+			if (UUserWidget* UserWidget = Cast<UUserWidget>(Widget))
+			{
+				if (UserWidget != this && !Visited.Contains(UserWidget))
+				{
+					Visited.Add(UserWidget);
+					if (UserWidget->GetClass()->ImplementsInterface(UBR_LobbyTeamSlotDisplayInterface::StaticClass()))
+					{
+						IBR_LobbyTeamSlotDisplayInterface::Execute_UpdateSlotDisplay(UserWidget);
+					}
+					// 자식 UserWidget 트리도 검색
+					if (UserWidget->WidgetTree)
+					{
+						TreesToProcess.Add(UserWidget->WidgetTree);
+					}
+				}
+			}
+		}
+	}
+
+	// 방 제목 갱신 (C++에서 직접 호출 → 블루프린트 OnRoomTitleRefreshed 구현 필요)
+	FString RoomTitle = UBRWidgetFunctionLibrary::GetRoomTitleForDisplay(this);
+	OnRoomTitleRefreshed(RoomTitle);
+
 	// 블루프린트 이벤트 호출
 	OnPlayerListChanged();
 }

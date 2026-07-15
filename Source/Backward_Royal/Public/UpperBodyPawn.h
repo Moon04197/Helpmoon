@@ -3,7 +3,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Pawn.h"
 #include "InputActionValue.h"
-#include "Misc/Optional.h" // [수정] UE 5.5 필수 헤더 (이게 없으면 오류 2천개 뜸)
+#include "Misc/Optional.h"
 #include "UpperBodyPawn.generated.h"
 
 // 전방 선언
@@ -22,6 +22,7 @@ public:
 
 protected:
 	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override; // 추가
 
 	// 매 프레임마다 몸통 회전을 따라가기 위해 Tick이 필요합니다.
 	virtual void Tick(float DeltaTime) override;
@@ -54,7 +55,7 @@ public:
 	class UInputAction* InteractAction;
 
 	UPROPERTY(EditAnywhere, Category = "Interaction")
-	float InteractionDistance = 300.0f;
+	float InteractionDistance;
 
 	// [수정] 이 변수가 없어서 TestSoloCharacter에서 에러가 났었습니다. 추가 필수!
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation")

@@ -4,10 +4,21 @@
 #include "CoreMinimal.h"
 #include "GameFramework/PlayerState.h"
 #include "BRUserInfo.h"
+#include "CustomizationInfo.h"
 #include "BRPlayerState.generated.h"
 
+UENUM(BlueprintType)
+enum class EPlayerStatus : uint8
+{
+	Alive       UMETA(DisplayName = "Alive"),		// 생존
+	Dead        UMETA(DisplayName = "Dead"),		// 사망
+	Spectating  UMETA(DisplayName = "Spectating")	// 관전
+};
+
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnPlayerRoleChanged, bool, bIsLowerBody);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnPlayerStatusChanged, EPlayerStatus, NewStatus);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnPlayerSwapAnim);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnCustomizationDataChanged);
 
 UCLASS()
 class BACKWARD_ROYAL_API ABRPlayerState : public APlayerState
@@ -29,7 +40,11 @@ public:
 	UPROPERTY(ReplicatedUsing = OnRep_IsReady, BlueprintReadWrite, Category = "Room")
 	bool bIsReady;
 
-	// 하체 역할 여부 (true = 하체, false = 상체)
+	/** 관전 슬롯 여부 (true = 관전 슬롯, PlayerIndex 0). 대기열(TeamID 0) 또는 사망 시 관전. (APlayerState::bIsSpectator와 구분) */
+	UPROPERTY(ReplicatedUsing = OnRep_PlayerRole, BlueprintReadOnly, Category = "Player Role")
+	bool bIsSpectatorSlot;
+
+	// 하체 역할 여부 (true = 하체, false = 상체). 관전이면 무시
 	UPROPERTY(ReplicatedUsing = OnRep_PlayerRole, BlueprintReadOnly, Category = "Player Role")
 	bool bIsLowerBody;
 
@@ -38,6 +53,10 @@ public:
 	// 상체인 경우: 연결된 하체 플레이어의 인덱스
 	UPROPERTY(ReplicatedUsing = OnRep_PlayerRole, BlueprintReadOnly, Category = "Player Role")
 	int32 ConnectedPlayerIndex;
+
+	/** 연결된 파트너 PlayerState (하체↔상체). 복제됨. 있으면 GetUpperBody/GetLowerBody에서 인덱스 대신 사용 */
+	UPROPERTY(ReplicatedUsing = OnRep_PlayerRole, BlueprintReadOnly, Category = "Player Role")
+	TObjectPtr<ABRPlayerState> PartnerPlayerState;
 
 	// 사용자 고유 ID (예: Steam ID, 계정 ID 등)
 	UPROPERTY(ReplicatedUsing = OnRep_UserUID, BlueprintReadWrite, Category = "User Info")
@@ -83,13 +102,36 @@ public:
 	UFUNCTION()
 	void OnRep_IsReady();
 
-	// 플레이어 역할 설정
+	// 플레이어 역할 설정 (하체/상체. 관전이 아닐 때만 사용)
 	UFUNCTION(BlueprintCallable, Category = "Player Role")
 	void SetPlayerRole(bool bLowerBody, int32 ConnectedIndex);
+
+	/** 관전으로 설정/해제. true 시 PlayerIndex 0(관전), false 시 하체/상체 역할 유지 */
+	UFUNCTION(BlueprintCallable, Category = "Player Role")
+	void SetSpectator(bool bSpectator);
 
 	// 플레이어 역할 변경 시 호출되는 이벤트
 	UFUNCTION()
 	void OnRep_PlayerRole();
+
+	UFUNCTION()
+	void OnRep_PartnerPlayerState();
+
+	/** [서버 전용] 유저 인포 관련 값이 바뀌었을 때 GameState의 PlayerListForDisplay 갱신 요청 */
+	void NotifyUserInfoChanged();
+
+	UPROPERTY(ReplicatedUsing = OnRep_PlayerStatus, BlueprintReadOnly, Category = "Status")
+	EPlayerStatus CurrentStatus = EPlayerStatus::Alive;
+
+	UFUNCTION()
+	void OnRep_PlayerStatus();	
+
+	// 서버에서 상태 변경 시 호출
+	void SetPlayerStatus(EPlayerStatus NewStatus);
+
+	// 상태 변경 시 UI 등에 알릴 델리게이트
+	UPROPERTY(BlueprintAssignable)
+	FOnPlayerStatusChanged OnPlayerStatusChanged;
 
 	UPROPERTY(BlueprintAssignable, Category = "Events")
 	FOnPlayerRoleChanged OnPlayerRoleChanged;
@@ -100,10 +142,28 @@ public:
 	UFUNCTION(Client, Reliable)
 	void ClientShowSwapAnim();
 
+	UFUNCTION(BlueprintCallable, Category = "Interaction")
 	void SwapControlWithPartner();
+
+	// ReplicatedUsing으로 변경하여 수신 시 함수 호출 유도
+	UPROPERTY(ReplicatedUsing = OnRep_CustomizationData, BlueprintReadOnly, Category = "Customization")
+	FBRCustomizationData CustomizationData;
+
+	// 구독 가능한 이벤트 디스패처
+	UPROPERTY(BlueprintAssignable, Category = "Events")
+	FOnCustomizationDataChanged OnCustomizationDataChanged;
+
+	// 서버에 내 커마 정보를 알리는 함수
+	UFUNCTION(Server, Reliable)
+	void ServerSetCustomizationData(const FBRCustomizationData& NewData);
+
+	UFUNCTION()
+	void OnRep_CustomizationData();
 
 protected:
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 	virtual void BeginPlay() override;
+
+	virtual void CopyProperties(APlayerState* PlayerState) override;
 };
 

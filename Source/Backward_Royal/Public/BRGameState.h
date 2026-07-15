@@ -3,11 +3,21 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/GameStateBase.h"
+#include "TimerManager.h"
 #include "BRUserInfo.h"
 #include "BRGameState.generated.h"
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnPlayerListChanged);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnTeamChanged);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnGameEndedWithWinner, int32, WinningTeamNumber);
+/** 매치 종료 시 (위치, 상체 이름, 하체 이름). MulticastMatchEnded에서 브로드캐스트 */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnMatchEnded, FVector, WinnerLocation, FString, UpperName, FString, LowerName);
+
+/** 전체 플레이어 상하체 배정이 완료되었을 때 (퍼즈 해제·UI 표시 등에 사용) */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnBodyAssignmentComplete);
+
+/** 모든 클라이언트가 스폰 완료 신호를 보낸 뒤 서버가 브로드캐스트. UI 전환·입력 해제 시점 */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnAllClientsSpawnReady);
 
 UCLASS()
 class BACKWARD_ROYAL_API ABRGameState : public AGameStateBase
@@ -29,9 +39,37 @@ public:
 	UPROPERTY(ReplicatedUsing = OnRep_PlayerCount, BlueprintReadOnly, Category = "Room")
 	int32 PlayerCount;
 
+	/** 서버가 채운 플레이어 목록(이름 등). 복제되어 클라이언트도 동일 목록으로 UI 표시 */
+	UPROPERTY(ReplicatedUsing = OnRep_PlayerListForDisplay, BlueprintReadOnly, Category = "Room")
+	TArray<FBRUserInfo> PlayerListForDisplay;
+
+	/** 로비 Entry 슬롯(0~7). 각 요소 = PlayerArray 인덱스 또는 -1(빈 슬롯). 서버에서만 수정, 복제됨 */
+	UPROPERTY(ReplicatedUsing = OnRep_LobbySlots, BlueprintReadOnly, Category = "Lobby")
+	TArray<int32> LobbyEntrySlots;
+
+	/** 로비 SelectTeam 슬롯 [팀1~4][관전/하체/상체]. 인덱스 = TeamIndex*3 + SlotIndex(0=관전,1=하체,2=상체). 값 = PlayerArray 인덱스 또는 -1 */
+	UPROPERTY(ReplicatedUsing = OnRep_LobbySlots, BlueprintReadOnly, Category = "Lobby")
+	TArray<int32> LobbyTeamSlots;
+
 	// 게임 시작 가능 여부
 	UPROPERTY(ReplicatedUsing = OnRep_CanStartGame, BlueprintReadOnly, Category = "Room")
 	bool bCanStartGame;
+
+	/** 승리한 팀 번호 (0=진행중, 1 이상=해당 팀 승리). 게임 종료 시 서버에서 설정, 복제됨 */
+	UPROPERTY(ReplicatedUsing = OnRep_WinningTeamNumber, BlueprintReadOnly, Category = "Game")
+	int32 WinningTeamNumber = 0;
+
+	/** [서버 설정 → 복제] 상하체 배정이 모두 끝나면 true. 클라이언트는 RepNotify로 수신 후 OnBodyAssignmentComplete 브로드캐스트 */
+	UPROPERTY(ReplicatedUsing = OnRep_BodyAssignmentComplete, BlueprintReadOnly, Category = "Game")
+	bool bBodyAssignmentComplete = false;
+
+	/** [서버 설정 → 복제] 모든 클라이언트가 ServerReportSpawnReady를 보낸 뒤 true. UI 전환·이동 입력 허용 시점 */
+	UPROPERTY(ReplicatedUsing = OnRep_AllClientsSpawnReady, BlueprintReadOnly, Category = "Game")
+	bool bAllClientsSpawnReady = false;
+
+	/** [서버 설정 → 복제] true면 로딩 창을 표시하지 않음. 맵을 로비 없이 바로 실행(테스트)할 때 사용. 블루프린트 로딩 위젯에서 이 값이 true면 AddToViewport 하지 않거나 즉시 제거. */
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Game")
+	bool bSkipLoadingScreen = false;
 
 	// 플레이어 목록 변경 이벤트
 	UPROPERTY(BlueprintAssignable, Category = "Events")
@@ -41,6 +79,37 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Events")
 	FOnTeamChanged OnTeamChanged;
 
+	/** 게임 종료(승리 확정) 시 브로드캐스트. WinningTeamNumber 전달 */
+	UPROPERTY(BlueprintAssignable, Category = "Events")
+	FOnGameEndedWithWinner OnGameEndedWithWinner;
+
+	/** 매치 종료 시 브로드캐스트 (승리 위치, 상체 플레이어 이름, 하체 플레이어 이름). MulticastMatchEnded에서 사용
+	UPROPERTY(BlueprintAssignable, Category = "Events")
+	FOnMatchEnded OnMatchEnded; */
+	
+	// 매치 종료(우승 팀 결정) 이벤트
+	UPROPERTY(BlueprintAssignable, Category = "Events")
+	FOnMatchEnded OnMatchEnded;
+
+	/** 전체 플레이어 상하체 배정 완료 시 브로드캐스트. 퍼즈 해제·입력 활성화·UI 표시 등에 바인딩 */
+	UPROPERTY(BlueprintAssignable, Category = "Events")
+	FOnBodyAssignmentComplete OnBodyAssignmentComplete;
+
+	/** 모든 클라이언트 스폰 완료 수신 후 브로드캐스트. 인게임 UI 전환·이동 입력 허용에 바인딩 */
+	UPROPERTY(BlueprintAssignable, Category = "Events")
+	FOnAllClientsSpawnReady OnAllClientsSpawnReady;
+
+	/** 블루프린트 위젯용: 이미 전원 스폰 완료(bAllClientsSpawnReady) 상태면 Object에 지정한 이벤트/함수 호출.
+	 *  Construct에서 OnAllClientsSpawnReady 바인딩한 뒤 이 함수를 호출하면, 복제가 먼저 와서 이벤트를 놓친 경우에도 UI 전환이 됨.
+	 *  @param Target 바인딩한 위젯(self 등)
+	 *  @param EventOrFunctionName 위젯에 있는 Custom Event 또는 함수 이름 (예: "OnSpawnReadyForUI") */
+	UFUNCTION(BlueprintCallable, Category = "Game", meta = (DisplayName = "Notify If Spawn Ready"))
+	void NotifyWidgetIfSpawnReady(UObject* Target, FName EventOrFunctionName);
+
+	// [서버->클라이언트] 매치 종료 이벤트를 모든 클라이언트에게 전파
+	UFUNCTION(NetMulticast, Reliable)
+	void MulticastMatchEnded(FVector WinnerLocation, const FString& UpperName, const FString& LowerName);
+	
 	// 플레이어 목록 업데이트
 	UFUNCTION(BlueprintCallable, Category = "Room")
 	void UpdatePlayerList();
@@ -52,6 +121,38 @@ public:
 	// 특정 플레이어의 UserInfo 가져오기
 	UFUNCTION(BlueprintCallable, Category = "Room")
 	FBRUserInfo GetPlayerUserInfo(int32 PlayerIndex) const;
+
+	/** 로비 Entry 표시용: 8슬롯. 빈 슬롯은 PlayerName 빈 FBRUserInfo. GetAllPlayerUserInfo 대신 로비 UI에서는 이걸 사용 권장 */
+	UFUNCTION(BlueprintCallable, Category = "Lobby")
+	TArray<FBRUserInfo> GetLobbyEntryDisplayList() const;
+
+	/** 로비 SelectTeam 팀별 슬롯 표시용. TeamIndex 0~3 = 팀1~4, SlotIndex 0=관전 1=하체 2=상체. 빈 슬롯은 PlayerName 빈 FBRUserInfo */
+	UFUNCTION(BlueprintCallable, Category = "Lobby")
+	FBRUserInfo GetLobbyTeamSlotInfo(int32 TeamIndex, int32 SlotIndex) const;
+
+	/** 로비 SelectTeam 표시용. 각 플레이어의 TeamID·PlayerIndex(0=관전, 1=하체, 2=상체)로 찾아서 해당 슬롯의 UserInfo 반환 */
+	UFUNCTION(BlueprintCallable, Category = "Lobby")
+	FBRUserInfo GetLobbyTeamSlotInfoByTeamIDAndPlayerIndex(int32 TeamID, int32 PlayerIndex) const;
+
+	/** [서버 전용] 해당 플레이어를 Entry에서 제거하고 SelectTeam 슬롯에 배치. 성공 시 true */
+	bool AssignPlayerToLobbyTeam(int32 PlayerIndex, int32 TeamIndex, int32 SlotIndex);
+	/** [서버 전용] SelectTeam 슬롯의 플레이어를 Entry 첫 빈 자리로 이동. 성공 시 true */
+	bool MovePlayerToLobbyEntry(int32 TeamIndex, int32 SlotIndex);
+
+	/** 방장(호스트) 플레이어 이름 가져오기. "○○'s Game" 표시용 */
+	UFUNCTION(BlueprintCallable, Category = "Room", meta = (DisplayName = "Get Host Player Name"))
+	FString GetHostPlayerName() const;
+
+	/** 서버에서 설정·복제되는 방 제목 (예: "○○'s Game"). 입장한 클라이언트도 동일하게 표시됨 */
+	UPROPERTY(ReplicatedUsing = OnRep_RoomTitle, BlueprintReadOnly, Category = "Room")
+	FString RoomTitle;
+
+	/** 방 제목 표시용. RoomTitle이 있으면 그대로 반환, 없으면 GetHostPlayerName() + "'s Game" (블루프린트/UI에서 사용) */
+	UFUNCTION(BlueprintCallable, Category = "Room", meta = (DisplayName = "Get Room Title Display"))
+	FString GetRoomTitleDisplay() const;
+
+	/** 서버 전용: 방 제목 설정 (방장 입장 시 호출) */
+	void SetRoomTitle(const FString& InRoomTitle);
 
 	// 게임 시작 가능 여부 확인
 	UFUNCTION(BlueprintCallable, Category = "Room")
@@ -73,12 +174,58 @@ public:
 	UFUNCTION()
 	void OnRep_PlayerCount();
 
+	// 복제된 플레이어 목록 수신 시 호출 (클라이언트 UI 갱신용)
+	UFUNCTION()
+	void OnRep_PlayerListForDisplay();
+
+	// 로비 Entry/SelectTeam 슬롯 복제 수신 시 호출
+	UFUNCTION()
+	void OnRep_LobbySlots();
+
 	// 게임 시작 가능 여부 변경 시 호출
 	UFUNCTION()
 	void OnRep_CanStartGame();
 
+	// 방 제목 복제 수신 시 호출
+	UFUNCTION()
+	void OnRep_RoomTitle();
+
+	/** 승리 팀 번호 복제 수신 시 호출 (UI 갱신용) */
+	UFUNCTION()
+	void OnRep_WinningTeamNumber();
+
+	/** 상하체 배정 완료 복제 수신 시 호출 (클라이언트에서 로딩 UI→인게임 UI 전환용, 델리게이트 브로드캐스트) */
+	UFUNCTION()
+	void OnRep_BodyAssignmentComplete();
+
+	/** 모든 클라이언트 스폰 완료 복제 수신 시 호출 (UI 전환·이동 입력 허용) */
+	UFUNCTION()
+	void OnRep_AllClientsSpawnReady();
+
+	/** [서버 전용] 기대 스폰 완료 신호 개수 설정 (상하체 배정 완료 시 팀 수*2 호출) */
+	void SetExpectedSpawnReadyCount(int32 Count);
+
+	/** [서버 전용] 클라이언트가 스폰 완료 RPC 보냈을 때 호출. 전원 수신 시 bAllClientsSpawnReady = true 및 브로드캐스트 */
+	void ReportClientSpawnReady(class APlayerController* PC);
+
+	/** [서버 전용] 승리 팀 설정 후 게임 종료 처리. WinningTeamNumber 설정 및 OnGameEndedWithWinner 브로드캐스트 */
+	void EndGameWithWinner(int32 WinnerTeamNumber);
+
+	/** 대기열 슬롯 압축: 빈 칸(-1) 제거 후 뒤 플레이어를 앞으로 당김. AssignPlayerToLobbyTeam / MovePlayerToLobbyEntry 후 호출 */
+	void CompactLobbyEntrySlots();
+
+	void MulticastMatchEnded_Implementation(FVector WinnerLocation, const FString& UpperName, const FString& LowerName);
+
 protected:
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 	virtual void BeginPlay() override;
+
+	/** [서버 전용] 스폰 완료 신호를 기대하는 컨트롤러 수 (플레이어/팀 수). 복제 안 함 */
+	int32 ExpectedSpawnReadyCount = 0;
+	/** [서버 전용] 이미 스폰 완료 신호를 보낸 컨트롤러. 중복 카운트 방지 */
+	TSet<class APlayerController*> SpawnReadyControllers;
+	/** [서버 전용] 전원 신호 대기 타임아웃. 만료 시 강제로 bAllClientsSpawnReady 처리 */
+	FTimerHandle SpawnReadyTimeoutHandle;
+	void OnSpawnReadyTimeout();
 };
 

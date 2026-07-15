@@ -1,4 +1,4 @@
-﻿#include "UpperBodyPawn.h"
+#include "UpperBodyPawn.h"
 #include "PlayerCharacter.h"
 #include "DropItem.h"
 #include "BaseWeapon.h"
@@ -11,7 +11,9 @@
 #include "EnhancedInputSubsystems.h"
 #include "BRAttackComponent.h"
 #include "BRPlayerController.h"
+#include "Engine/OverlapResult.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "Kismet/KismetMathLibrary.h"
 #include "DrawDebugHelpers.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogUpperBodyPawn, Log, All);
@@ -20,7 +22,12 @@ DEFINE_LOG_CATEGORY_STATIC(LogUpperBodyPawn, Log, All);
 AUpperBodyPawn::AUpperBodyPawn()
 {
 	PrimaryActorTick.bCanEverTick = true;
-	PrimaryActorTick.TickGroup = TG_PostUpdateWork;
+	PrimaryActorTick.TickGroup = TG_PostPhysics;
+
+	// 서버에서 스폰된 상체가 모든 클라이언트에 보이도록 복제 명시 (미설정 시 하체만 4명 보이는 현상 방지)
+	bReplicates = true;
+	SetReplicateMovement(true);
+	bOnlyRelevantToOwner = false;
 
 	RootComponent = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
 
@@ -36,8 +43,10 @@ AUpperBodyPawn::AUpperBodyPawn()
 	FrontCameraBoom->bInheritYaw = true;
 	FrontCameraBoom->bInheritRoll = false;
 
-	FrontCameraBoom->bEnableCameraLag = false;
-	FrontCameraBoom->bEnableCameraRotationLag = false;
+	FrontCameraBoom->bEnableCameraLag = true;           // 이동 지연 켜기
+	FrontCameraBoom->CameraLagSpeed = 20.0f;            // 이동 지연 속도
+	FrontCameraBoom->bEnableCameraRotationLag = true;   // 회전 지연 켜기 (끌려갈 때 부드럽게)
+	FrontCameraBoom->CameraRotationLagSpeed = 15.0f;    // 수치가 작을수록 더 부드럽고 늦게 따라감
 
 	FrontCamera = CreateDefaultSubobject<UCameraComponent>(TEXT("FrontCamera"));
 	FrontCamera->SetupAttachment(FrontCameraBoom);
@@ -45,12 +54,17 @@ AUpperBodyPawn::AUpperBodyPawn()
 
 	LastBodyYaw = 0.0f;
 	ParentBodyCharacter = nullptr;
-	InteractionDistance = 300.0f;
+	InteractionDistance = 100.f;
 }
 
 void AUpperBodyPawn::BeginPlay()
 {
 	Super::BeginPlay();
+
+	if (FrontCameraBoom)
+	{
+		FrontCameraBoom->AddTickPrerequisiteActor(this);
+	}
 
 	// 입력 매핑 등록
 	if (APlayerController* PC = Cast<APlayerController>(Controller))
@@ -85,6 +99,23 @@ void AUpperBodyPawn::BeginPlay()
 
 	//	GEngine->AddOnScreenDebugMessage(-1, 5.f, FColor::Magenta, DebugMsg);
 	//}
+}
+
+void AUpperBodyPawn::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	Super::EndPlay(EndPlayReason);
+
+	// [크래시 방지] 물리/충돌 컴포넌트 정리
+	// 상체 폰은 RootComponent가 SceneComponent일 수 있으나, 
+	// 혹시 모를 물리 충돌이나 자식 컴포넌트의 물리 작용을 차단
+	if (RootComponent)
+	{
+		if (UPrimitiveComponent* PrimComp = Cast<UPrimitiveComponent>(RootComponent))
+		{
+			PrimComp->SetSimulatePhysics(false);
+			PrimComp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		}
+	}
 }
 
 void AUpperBodyPawn::Tick(float DeltaTime)
@@ -267,79 +298,81 @@ void AUpperBodyPawn::OnAttackMontageEnded(UAnimMontage* Montage, bool bInterrupt
 
 void AUpperBodyPawn::Interact(const FInputActionValue& Value)
 {
-	// 1. 부모(몸통) 캐릭터 확인
 	if (!ParentBodyCharacter)
 	{
 		ParentBodyCharacter = Cast<APlayerCharacter>(GetAttachParentActor());
 		if (!ParentBodyCharacter) return;
 	}
 
-	// 2. 트레이스 시작점 및 끝점 설정
-	FVector Start;
-	if (ParentBodyCharacter->GetMesh() && ParentBodyCharacter->GetMesh()->DoesSocketExist(TEXT("head")))
-	{
-		Start = ParentBodyCharacter->HeadMountPoint->GetComponentLocation();
-	}
-	else
-	{
-		Start = FrontCamera->GetComponentLocation();
-	}
+	// 1. 탐색 시작점 설정 (캐릭터 위치 중심)
+	FVector SearchOrigin = ParentBodyCharacter->GetActorLocation();
 
-	FVector End = Start + (FrontCamera->GetForwardVector() * InteractionDistance);
+	// [추가됨] 탐색 범위를 시각적으로 확인하기 위한 노란색 디버그 구체 그리기
+	// 선 굵기 1.0f, 2초 동안 표시됩니다.
+	DrawDebugSphere(GetWorld(), SearchOrigin, InteractionDistance, 16, FColor::Yellow, false, 2.0f, 0, 1.0f);
 
-	// 3. 트레이스 설정 및 현재 장착 무기 제외
-	FHitResult HitResult;
+	// 2. 주변의 모든 액터 검출 (Overlap)
+	TArray<FOverlapResult> OverlapResults;
+	FCollisionShape SearchSphere = FCollisionShape::MakeSphere(InteractionDistance);
 	FCollisionQueryParams QueryParams;
 	QueryParams.AddIgnoredActor(this);
 	QueryParams.AddIgnoredActor(ParentBodyCharacter);
 
-	// [핵심 추가] 현재 손에 들고 있는 무기가 있다면 트레이스 대상에서 제외
 	if (ParentBodyCharacter->CurrentWeapon)
 	{
 		QueryParams.AddIgnoredActor(ParentBodyCharacter->CurrentWeapon);
 	}
 
-	// 구체 반지름 설정
-	float TraceRadius = 25.0f;
-
-	// Sphere Trace 실행
-	bool bHit = GetWorld()->SweepSingleByChannel(
-		HitResult,
-		Start,
-		End,
+	// ECC_Visibility 채널을 사용하여 주변 액터 탐색
+	bool bHasOverlap = GetWorld()->OverlapMultiByChannel(
+		OverlapResults,
+		SearchOrigin,
 		FQuat::Identity,
 		ECC_Visibility,
-		FCollisionShape::MakeSphere(TraceRadius),
+		SearchSphere,
 		QueryParams
 	);
 
-	// 4. 시각화 및 상호작용 로직
-	if (bHit)
+	if (bHasOverlap)
 	{
-		AActor* HitActor = HitResult.GetActor();
+		AActor* ClosestActor = nullptr;
+		float MinDistance = InteractionDistance; // 초기값 설정
 
-		// 인터페이스 구현 여부 확인
-		if (HitActor && HitActor->GetClass()->ImplementsInterface(UInteractableInterface::StaticClass()))
+		for (const FOverlapResult& Result : OverlapResults)
 		{
-			// 이미 들고 있는 무기를 다시 줍는 것을 방지하기 위한 안전장치 (선택 사항)
-			if (HitActor != ParentBodyCharacter->CurrentWeapon)
-			{
-				ServerRequestInteract(HitActor);
+			AActor* PotentialActor = Result.GetActor();
+			if (!PotentialActor) continue;
 
-				if (GEngine)
+			// 상호작용 인터페이스 구현 여부 확인
+			if (PotentialActor->GetClass()->ImplementsInterface(UInteractableInterface::StaticClass()))
+			{
+				float DistanceToActor = FVector::Dist(SearchOrigin, PotentialActor->GetActorLocation());
+
+				// 가장 가까운 액터 갱신
+				if (DistanceToActor < MinDistance)
 				{
-					GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Cyan,
-						FString::Printf(TEXT("Requesting Server Interact: %s"), *HitActor->GetName()));
+					MinDistance = DistanceToActor;
+					ClosestActor = PotentialActor;
 				}
 			}
 		}
 
-		DrawDebugLine(GetWorld(), Start, HitResult.ImpactPoint, FColor::Green, false, 2.0f, 0, 1.5f);
-		DrawDebugSphere(GetWorld(), HitResult.ImpactPoint, TraceRadius, 12, FColor::Green, false, 2.0f);
+		// 3. 가장 가까운 액터를 찾았다면 서버에 상호작용 요청
+		if (ClosestActor)
+		{
+			ServerRequestInteract(ClosestActor);
+
+			// GEngine 대신 클래스 전용 커스텀 디버그 로그 매크로 사용
+			BODY_LOG(Log, TEXT("Closest Interactable Found: %s"), *ClosestActor->GetName());
+
+			// 대상을 찾았을 때 무기 위치에 초록색 구체로 표시
+			DrawDebugSphere(GetWorld(), ClosestActor->GetActorLocation(), 30.0f, 12, FColor::Green, false, 2.0f);
+		}
 	}
 	else
 	{
-		DrawDebugLine(GetWorld(), Start, End, FColor::Red, false, 2.0f, 0, 1.0f);
+		// 아무것도 찾지 못했을 때 전체 범위를 빨간색으로 표시
+		DrawDebugSphere(GetWorld(), SearchOrigin, InteractionDistance, 12, FColor::Red, false, 1.0f);
 	}
 }
 

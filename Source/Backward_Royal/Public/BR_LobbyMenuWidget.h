@@ -3,6 +3,7 @@
 
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
+#include "TimerManager.h"
 #include "BR_LobbyMenuWidget.generated.h"
 
 class ABRPlayerController;
@@ -67,13 +68,24 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Team")
 	void SetMyTeamNumber(int32 TeamNumber);
 
-	// 자신의 플레이어 역할 설정 (0=하체, 1=상체)
+	/** 자신의 플레이어 역할 설정. PlayerIndex 0=관전, 1=하체, 2=상체 */
 	UFUNCTION(BlueprintCallable, Category = "Player Role")
 	void SetMyPlayerRole(int32 PlayerIndex);
+
+	/**
+	 * 로비: WBP_SelectTeam_0~3 중 하나에서 관전/1P/2P 버튼 클릭 시 호출.
+	 * TeamID 1~4 = 1팀~4팀, PlayerIndex 0=관전, 1=1P(하체), 2=2P(상체).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Lobby")
+	void AssignMyPlayerToTeamSlot(int32 TeamID, int32 PlayerIndex);
 
 	// 플레이어 목록 변경 이벤트 (블루프린트에서 바인딩 가능)
 	UFUNCTION(BlueprintImplementableEvent, Category = "Events")
 	void OnPlayerListChanged();
+
+	/** 방 제목 갱신 이벤트 - RoomTitle 문자열을 TextBlock에 표시하도록 블루프린트에서 구현 */
+	UFUNCTION(BlueprintImplementableEvent, Category = "Events", meta = (DisplayName = "On Room Title Refreshed"))
+	void OnRoomTitleRefreshed(const FString& RoomTitle);
 
 	// 팀 변경 이벤트 (블루프린트에서 바인딩 가능)
 	UFUNCTION(BlueprintImplementableEvent, Category = "Events")
@@ -91,6 +103,9 @@ private:
 	// GameState 참조 (mutable로 선언하여 const 함수에서도 수정 가능)
 	UPROPERTY()
 	mutable ABRGameState* CachedGameState;
+
+	/** 늦게 들어온 클라이언트용: 복제가 늦게 도착해도 UI 갱신하기 위한 지연 갱신 타이머 */
+	FTimerHandle LateJoinerRefreshTimerHandle;
 
 	// 이벤트 바인딩 해제를 위한 함수들
 	UFUNCTION()

@@ -11,6 +11,7 @@ class UNetDriver;
 class UNetConnection;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnPawnChanged, APawn*, NewPawn);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnEnterSpectatorMode);
 
 UCLASS()
 class BACKWARD_ROYAL_API ABRPlayerController : public APlayerController
@@ -40,6 +41,10 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Session")
 	void JoinRoomWithPlayerName(int32 SessionIndex, const FString& PlayerName);
 
+	/** 로비에서 방 나가기. 클라이언트는 서버 연결을 끊고, 호스트는 세션을 종료한 뒤 메인 맵으로 이동합니다. */
+	UFUNCTION(BlueprintCallable, Category = "Session")
+	void LeaveRoom();
+
 	// 준비 상태 토글
 	UFUNCTION(BlueprintCallable, Exec, Category = "Room")
 	void ToggleReady();
@@ -68,6 +73,18 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Player Role")
 	void SetMyPlayerRole(bool bLowerBody);
 
+	/** 로비: Entry → SelectTeam 슬롯 배치 요청. TeamIndex 0~3=팀1~4, SlotIndex 0=관전 1=1Player(하체) 2=2Player(상체) */
+	UFUNCTION(BlueprintCallable, Category = "Lobby")
+	void RequestAssignToLobbyTeam(int32 TeamIndex, int32 SlotIndex);
+
+	/** 로비: SelectTeam 슬롯 → Entry로 이동 요청 (해당 팀/슬롯의 플레이어를 Entry 첫 빈 자리로) */
+	UFUNCTION(BlueprintCallable, Category = "Lobby")
+	void RequestMoveToLobbyEntry(int32 TeamIndex, int32 SlotIndex);
+
+	/** 로비: 자신이 현재 있는 팀 슬롯을 찾아 대기열(Entry)로 이동 요청. 팀에 없으면 아무 동작 안 함 */
+	UFUNCTION(BlueprintCallable, Category = "Lobby")
+	void RequestMoveMyPlayerToLobbyEntry();
+
 	// 현재 상태 확인: ShowRoomInfo
 	UFUNCTION(Exec, Category = "Room")
 	void ShowRoomInfo();
@@ -76,9 +93,21 @@ public:
 	UFUNCTION(Client, Reliable)
 	void ClientNotifyGameStarting();
 
-	// 역할에 따른 입력 매핑 교체 함수
+	/** PIE 등에서 ServerTravel이 클라이언트를 따라오지 않을 때, 서버가 지정한 URL로 직접 이동 */
+	UFUNCTION(Client, Reliable)
+	void ClientTravelToGameMap(const FString& TravelURL);
+
+	/** 입장 직후 방 제목 전달 (복제 대기 없이 "○○'s Game" 즉시 표시) */
+	UFUNCTION(Client, Reliable)
+	void ClientReceiveRoomTitle(const FString& RoomTitle);
+
+	/** 서버가 입장 직후 클라이언트에 로비 UI 갱신 요청 (늦게 들어온 3·4번째 클라이언트 UI 동기화용) */
+	UFUNCTION(Client, Reliable)
+	void ClientRequestLobbyUIRefresh();
+
+	/** 역할에 따른 입력 매핑 교체. 하체 시 OptionalPawnForFallback 전달 시 해당 폰(PlayerCharacter)의 DefaultMappingContext 폴백 사용 */
 	UFUNCTION(BlueprintCallable, Category = "Input")
-	void SetupRoleInput(bool bIsLower);
+	void SetupRoleInput(bool bIsLower, class APawn* OptionalPawnForFallback = nullptr);
 
 	// 에디터에서 할당할 수 있도록 Mapping Context 변수 추가
 	UPROPERTY(EditAnywhere, Category = "Input")
@@ -86,6 +115,13 @@ public:
 
 	UPROPERTY(EditAnywhere, Category = "Input")
 	class UInputMappingContext* UpperBodyContext;
+
+	// [관전 모드 입력]
+	UPROPERTY(EditAnywhere, Category = "Input")
+	class UInputAction* IA_SpectatorMove;
+
+	UPROPERTY(EditAnywhere, Category = "Input")
+	class UInputAction* IA_SpectatorLook;
 
 	// ========== UI 관리 시스템 ==========
 	
@@ -130,6 +166,9 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "UI")
 	void SetMainScreenToLobbyMenu();
 
+	/** PIE/서버 종료 시 위젯 참조를 먼저 끊을 때 호출 (GameInstance DoPIEExitCleanup에서 호출) */
+	void ClearUIForShutdown();
+
 	UFUNCTION(BlueprintCallable, Category = "UI")
 	void HideCurrentMenu();
 
@@ -141,15 +180,48 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Events")
 	FOnPawnChanged OnPawnChanged;
 
+	// 로컬 GameInstance의 커마 정보를 서버로 전송하는 함수
+	UFUNCTION(BlueprintCallable, Category = "Customization")
+	void SubmitCustomizationToServer();
+
+	// 관전 모드로 전환 (서버에서 호출)
+	UFUNCTION(BlueprintCallable, Category = "Spectating")
+	void StartSpectatingMode();
+
+	// 관전 모드용 입력 설정 (하체 컨텍스트 재사용)
+	UFUNCTION(BlueprintCallable, Category = "Spectating")
+	void SetupSpectatorInput();
+
+	// [클라이언트] 관전 모드 진입 시 UI 처리 요청
+	UFUNCTION(Client, Reliable)
+	void ClientHandleSpectatorUI();
+
+	// [BP 구현] 관전 모드 진입 시 UI 변경 (HUD 숨기기 등)
+	UFUNCTION(BlueprintImplementableEvent, Category = "Spectating")
+	void OnEnterSpectatorMode();
+
+	/** 관전 모드 진입 시 브로드캐스트 (위젯에서 바인딩 가능) */
+	UPROPERTY(BlueprintAssignable, Category = "Spectating")
+	FOnEnterSpectatorMode OnEnterSpectatorModeDelegate;
+
 protected:
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+
+	virtual void SetupInputComponent() override;
+
 	// 서버에서 빙의했을 때 호출됨
 	virtual void OnPossess(APawn* aPawn) override;
 
+	/** 클라이언트에서 폰 빙의 인정 시 호출. 스폰 완료 신호 전송용. */
+	virtual void AcknowledgePossession(APawn* P) override;
+
 	// 클라이언트에서 폰 정보가 복제되었을 때 호출됨
 	virtual void OnRep_Pawn() override;
-	
+
+	/** 상체 빙의 시 ViewTarget/입력 적용 (복제 타이밍에 따라 한 클라이언트만 누락되는 현상 방지용으로 다음 틱에도 재적용) */
+	void ApplyUpperBodyViewAndInput();
+
 	// 네트워크 연결 실패 감지
 	void HandleNetworkFailure(UWorld* World, UNetDriver* NetDriver, ENetworkFailure::Type FailureType, const FString& ErrorString);
 
@@ -176,6 +248,7 @@ protected:
 	UFUNCTION(Server, Reliable)
 	void ServerRequestChangePlayerTeam(int32 PlayerIndex, int32 NewTeamNumber);
 
+	/** 게임 시작 요청 (클라이언트→서버). 주의: 블루프린트에서 오버라이드 시 파라미터를 추가/변경하면 ReceivePropertiesForRPC Mismatch로 연결이 끊깁니다. 시그니처 변경 금지. */
 	UFUNCTION(Server, Reliable)
 	void ServerRequestStartGame();
 
@@ -188,7 +261,26 @@ protected:
 	UFUNCTION(Server, Reliable)
 	void ServerSetPlayerRole(bool bLowerBody);
 
+	UFUNCTION(Server, Reliable)
+	void ServerRequestAssignToLobbyTeam(int32 TeamIndex, int32 SlotIndex);
+
+	UFUNCTION(Server, Reliable)
+	void ServerRequestMoveToLobbyEntry(int32 TeamIndex, int32 SlotIndex);
+
+	/** 클라이언트 스폰 완료 신호 (클라이언트→서버). AcknowledgePossession에서 호출. */
+	UFUNCTION(Server, Reliable)
+	void ServerReportSpawnReady();
+
 private:
+	/** RPC 레이트 리밋: 민감한 서버 RPC 호출 간 최소 간격(초). */
+	static constexpr float MinSensitiveRPCIntervalSec = 0.5f;
+	/** 마지막 민감 RPC 호출 시각 (GetTimeSeconds). */
+	float LastSensitiveRPCTime = 0.f;
+	/** 민감 RPC 레이트 리밋 검사. 서버에서만 사용. */
+	bool CheckSensitiveRPCRateLimit();
+	/** 현재 맵이 로비 맵(Main_Scene 등)인지 여부. */
+	bool IsInLobbyMap() const;
+
 	// 내부 헬퍼 함수들
 	void RequestRandomTeams();
 	void RequestChangePlayerTeam(int32 PlayerIndex, int32 NewTeamNumber);
@@ -207,5 +299,29 @@ private:
 
 	// BeginPlay UI 초기화 타이머 (EndPlay에서 해제하여 open ?listen 크래시 방지)
 	FTimerHandle BeginPlayUITimerHandle;
+
+	/** 상체 ViewTarget/입력 지연 재적용 타이머 (OnRep_Pawn 후 한 틱 뒤 재적용) */
+	FTimerHandle UpperBodyViewInputDelayHandle;
+
+	FTimerHandle TimerHandle_RetrySubmitCustomization;
+
+	/** 호스트가 방 나가기 후 메인 맵에서 ListenServer NetDriver를 한 번만 종료해 Standalone으로 전환 (방 찾기 가능하도록) */
+	FTimerHandle ShutdownListenServerTimerHandle;
+	void TryShutdownListenServerForRoomSearch();
+
+	/** 관전 모드 이동 처리 */
+	void Input_SpectatorMove(const struct FInputActionValue& Value);
+
+	/** 관전 모드 시점 회전 처리 */
+	void Input_SpectatorLook(const struct FInputActionValue& Value);
+
+	/** OnAllClientsSpawnReady 수신 시 하체 플레이어 이동 입력 해제 (바인딩은 OnPossess에서 1회) */
+	UFUNCTION()
+	void OnAllClientsSpawnReadyCallback();
+	bool bSpawnReadyDelegateBound = false;
+
+	/** 클라이언트: bSkipLoadingScreen 복제 지연 시 0.5초 후 재확인하여 입력 해제 (테스트 맵 직접 실행) */
+	FTimerHandle SkipLoadingScreenCheckHandle;
+	void TryUnblockInputIfSkipLoadingScreen();
 };
 

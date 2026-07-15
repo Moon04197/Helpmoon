@@ -1,4 +1,5 @@
-﻿#include "BRAttackComponent.h"
+﻿// BRAttackComponent.cpp
+#include "BRAttackComponent.h"
 #include "BaseCharacter.h"
 #include "BaseWeapon.h"
 #include "TimerManager.h"
@@ -8,20 +9,24 @@
 
 DEFINE_LOG_CATEGORY(LogAttackComp);
 
+// 기본 펀치 데미지 전역 변수
+
+float UBRAttackComponent::Global_BasePunchDamage = 10.0f;
+
 UBRAttackComponent::UBRAttackComponent()
 {
-	PrimaryComponentTick.bCanEverTick = false;
+    PrimaryComponentTick.bCanEverTick = false;
+    SetIsReplicatedByDefault(true); // 수정
 }
 
 void UBRAttackComponent::BeginPlay()
 {
-	Super::BeginPlay();
+    Super::BeginPlay();
 }
 
 void UBRAttackComponent::ServerSetAttackDetection_Implementation(bool bEnabled)
 {
-	// 서버에서 실제 판정 변수를 켭니다.
-	SetAttackDetection(bEnabled);
+    SetAttackDetection(bEnabled);
 }
 
 void UBRAttackComponent::SetAttackDetection(bool bEnabled)
@@ -30,13 +35,18 @@ void UBRAttackComponent::SetAttackDetection(bool bEnabled)
     ABaseCharacter* OwnerChar = Cast<ABaseCharacter>(GetOwner());
     if (!OwnerChar) return;
 
-    // 클라이언트에서 호출되었더라도 실제 물리 설정 변경은 서버 RPC를 통해 서버에서 실행되어야 함
     if (!GetOwner()->HasAuthority())
     {
         ServerSetAttackDetection(bEnabled);
     }
 
-    // 1. 무기가 있는 경우 (기존 로직)
+    // 공격이 새로 시작될 때마다 피격 액터 목록을 초기화하여 여러 번 휘두를 때 정상 타격되도록 보정
+    if (bEnabled)
+    {
+        HitActors.Empty();
+    }
+
+    // 1. 무기 공격 설정
     if (OwnerChar->CurrentWeapon)
     {
         UStaticMeshComponent* WeaponMesh = OwnerChar->CurrentWeapon->WeaponMesh;
@@ -44,31 +54,19 @@ void UBRAttackComponent::SetAttackDetection(bool bEnabled)
         {
             if (bEnabled)
             {
-                if (bEnabled)
+                if (GetOwner()->HasAuthority())
                 {
-                    // 공격 활성화 시
-                    // 서버에서만 물리 설정을 변경하도록 보장
-                    if (GetOwner()->HasAuthority())
+                    WeaponMesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+                    WeaponMesh->SetCollisionResponseToAllChannels(ECR_Block);
+                    WeaponMesh->IgnoreActorWhenMoving(OwnerChar, true);
+
+                    TArray<AActor*> AttachedActors;
+                    OwnerChar->GetAttachedActors(AttachedActors);
+                    for (AActor* Attached : AttachedActors)
                     {
-                        WeaponMesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-                        WeaponMesh->SetCollisionResponseToAllChannels(ECR_Block);
-
-                        // 캐릭터 본인 및 상체 Pawn과의 물리 충돌 무시 설정
-                        WeaponMesh->IgnoreActorWhenMoving(OwnerChar, true);
-
-                        TArray<AActor*> AttachedActors;
-                        OwnerChar->GetAttachedActors(AttachedActors);
-                        for (AActor* Attached : AttachedActors)
-                        {
-                            WeaponMesh->IgnoreActorWhenMoving(Attached, true);
-                        }
-                        WeaponMesh->SetNotifyRigidBodyCollision(true);
+                        WeaponMesh->IgnoreActorWhenMoving(Attached, true);
                     }
-
-                    if (!WeaponMesh->OnComponentHit.IsAlreadyBound(this, &UBRAttackComponent::InternalHandleOwnerHit))
-                    {
-                        WeaponMesh->OnComponentHit.AddDynamic(this, &UBRAttackComponent::InternalHandleOwnerHit);
-                    }
+                    WeaponMesh->SetNotifyRigidBodyCollision(true);
                 }
 
                 if (!WeaponMesh->OnComponentHit.IsAlreadyBound(this, &UBRAttackComponent::InternalHandleOwnerHit))
@@ -80,7 +78,7 @@ void UBRAttackComponent::SetAttackDetection(bool bEnabled)
             {
                 if (GetOwner()->HasAuthority())
                 {
-                    // 무기가 아직 장착된 상태인지 확인하는 방어 코드 추가
+                    // 무기가 캐릭터에 붙어있는 상태라면 충돌 해제
                     if (OwnerChar->CurrentWeapon && OwnerChar->CurrentWeapon->GetAttachParentActor() == OwnerChar)
                     {
                         WeaponMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
@@ -92,77 +90,98 @@ void UBRAttackComponent::SetAttackDetection(bool bEnabled)
             }
         }
     }
-    // 2. [추가] 무기가 없는 경우 (맨손 공격)
+    // 2. 맨손 공격 설정
     else
     {
         USkeletalMeshComponent* BodyMesh = OwnerChar->GetMesh();
-
         if (BodyMesh)
         {
             if (bEnabled)
             {
-                // [변경] 물리 속성(Block)은 건드리지 않고, 히트 이벤트 생성만 켭니다.
+                BodyMesh->SetCollisionObjectType(ECC_WorldDynamic);
+                BodyMesh->SetCollisionResponseToChannel(ECC_Pawn, ECR_Block);
                 BodyMesh->SetNotifyRigidBodyCollision(true);
-
                 if (!BodyMesh->OnComponentHit.IsAlreadyBound(this, &UBRAttackComponent::InternalHandleOwnerHit))
                 {
                     BodyMesh->OnComponentHit.AddDynamic(this, &UBRAttackComponent::InternalHandleOwnerHit);
                 }
-
-                // 디버그
-                //GEngine->AddOnScreenDebugMessage(-1, 0.5f, FColor::Red, TEXT("Unarmed Attack Window OPEN"));
             }
             else
             {
-                // 공격 종료 시 이벤트 생성 끄기 (최적화)
+                BodyMesh->SetCollisionObjectType(ECC_Pawn);
+                BodyMesh->SetCollisionResponseToChannel(ECC_Pawn, ECR_Overlap);
                 BodyMesh->SetNotifyRigidBodyCollision(false);
-
                 BodyMesh->OnComponentHit.RemoveDynamic(this, &UBRAttackComponent::InternalHandleOwnerHit);
                 HitActors.Empty();
-
-                //GEngine->AddOnScreenDebugMessage(-1, 0.5f, FColor::Green, TEXT("Unarmed Attack Window CLOSED"));
             }
+
         }
+    }
+}
+
+// 히트 스탑 적용 함수
+void UBRAttackComponent::ApplyHitStop(float Duration)
+{
+    ABaseCharacter* OwnerChar = Cast<ABaseCharacter>(GetOwner());
+    if (OwnerChar)
+    {
+        // 1. 캐릭터 시간을 0.01배속(거의 정지)으로 설정
+        OwnerChar->CustomTimeDilation = 0.01f;
+
+        // 2. 지정된 시간 후에 ResetHitStop 호출
+        GetWorld()->GetTimerManager().SetTimer(HitStopTimerHandle, this, &UBRAttackComponent::ResetHitStop, Duration, false);
+    }
+}
+
+// 멀티캐스트 구현: 서버에서 호출하면 모든 클라이언트가 ApplyHitStop 실행
+void UBRAttackComponent::MulticastApplyHitStop_Implementation(float Duration)
+{
+    ApplyHitStop(Duration);
+}
+
+// 히트 스탑 해제 및 애니메이션 종료
+void UBRAttackComponent::ResetHitStop()
+{
+    ABaseCharacter* OwnerChar = Cast<ABaseCharacter>(GetOwner());
+    if (OwnerChar)
+    {
+        // 1. 시간 속도 정상 복구
+        OwnerChar->CustomTimeDilation = 1.0f;
+
+        // 2. 공격 애니메이션 강제 종료 (Idle 복귀)
+        OwnerChar->StopAnimMontage();
     }
 }
 
 void UBRAttackComponent::InternalHandleOwnerHit(UPrimitiveComponent* HitComponent, AActor* OtherActor, UPrimitiveComponent* OtherComp, FVector NormalImpulse, const FHitResult& Hit)
 {
-	// 1. 기본 조건 체크 (공통)
-	if (!bIsDetectionActive || !OtherActor || OtherActor == GetOwner()) return;
+    if (!bIsDetectionActive || !OtherActor || OtherActor == GetOwner()) return;
 
-	//FString NetMode = GetOwner()->HasAuthority() ? TEXT("Server") : TEXT("Client");
-	//GEngine->AddOnScreenDebugMessage(-1, 1.f, FColor::White, FString::Printf(TEXT("[%s] Physics Hit: %s"), *NetMode, *OtherActor->GetName()));
+    ABaseCharacter* OwnerChar = Cast<ABaseCharacter>(GetOwner());
+    if (!OwnerChar) return;
 
-	// 2. 캐릭터 참조 가져오기
-	ABaseCharacter* OwnerChar = Cast<ABaseCharacter>(GetOwner());
-	if (!OwnerChar) return;
-
-    // [중요] 부위별 판정 (맨손일 때만)
+    // 맨손일 때 손/팔 부위만 판정
     if (OwnerChar->CurrentWeapon == nullptr)
     {
-        // Physics Asset에 설정된 Body(Bone) 이름 확인
         FName HitBone = Hit.MyBoneName;
         FString HitBoneStr = HitBone.ToString().ToLower();
-
-        // "hand" 또는 "fist" 등이 포함된 뼈인지 확인
         bool bIsHandHit = HitBoneStr.Contains(TEXT("hand")) || HitBoneStr.Contains(TEXT("lowerarm"));
-        if (!bIsHandHit)
-        {
-            // 몸싸움 중이라 몸통이나 발이 닿은 경우 -> 데미지 판정 X
-            return;
-        }
+        if (!bIsHandHit) return;
     }
 
-	// 3. 권한 체크 (데미지 처리는 서버에서만)
-	if (!GetOwner()->HasAuthority()) return;
+    if (!GetOwner()->HasAuthority()) return;
 
-	// 4. [서버 전용] 데미지 및 물리 로직
-	if (HitActors.Contains(OtherActor)) return;
-
-	//GEngine->AddOnScreenDebugMessage(-1, 2.f, FColor::Green, TEXT("Applying Damage on Server"));
+    if (HitActors.Contains(OtherActor)) return;
 
     ProcessHitDamage(OtherActor, OtherComp, NormalImpulse, Hit);
+}
+
+void UBRAttackComponent::MulticastPlayHitSound_Implementation(USoundBase* SoundToPlay, FVector Location, float Volume)
+{
+    if (SoundToPlay)
+    {
+        UGameplayStatics::PlaySoundAtLocation(this, SoundToPlay, Location, Volume);
+    }
 }
 
 void UBRAttackComponent::ProcessHitDamage(AActor* OtherActor, UPrimitiveComponent* OtherComp, const FVector& NormalImpulse, const FHitResult& Hit)
@@ -170,56 +189,105 @@ void UBRAttackComponent::ProcessHitDamage(AActor* OtherActor, UPrimitiveComponen
     ABaseCharacter* OwnerChar = Cast<ABaseCharacter>(GetOwner());
     ABaseWeapon* MyWeapon = OwnerChar->CurrentWeapon;
 
-	if (HitActors.Contains(OtherActor)) return;
+    if (HitActors.Contains(OtherActor)) return;
 
-    // 데미지 계산
-	float ImpactForce = NormalImpulse.Size();
-    float CalculatedDamage = 0.0f; 
+    // [수정] 피지컬 애니메이션 적용 시 무기 충돌 반발력이 수십만 단위로 폭증하여 무기가 즉시 파괴되는 현상 방지를 위해 제한(Clamp)
+    float ImpactForce = FMath::Clamp(NormalImpulse.Size(), 0.0f, 5000.0f);
+    float ImpulseMultiplier = 1.0f;
 
+    if (MyWeapon)
+    {
+        ImpulseMultiplier = ABaseWeapon::GlobalImpulseMultiplier * MyWeapon->CurrentWeaponData.MassKg * MyWeapon->CurrentWeaponData.ImpulseCoefficient;
+    }
+
+    float FinalImpulsePower = FMath::Max(ImpactForce * ImpulseMultiplier, 500.0f);
+
+    FVector ImpulseDir = -Hit.ImpactNormal;
+    if (ImpulseDir.IsNearlyZero()) ImpulseDir = OwnerChar->GetActorForwardVector();
+
+    FVector FinalImpulseVector = ImpulseDir * FinalImpulsePower;
+
+    // [충격량 미리 주입]
+    if (ABaseCharacter* Victim = Cast<ABaseCharacter>(OtherActor))
+    {
+        Victim->SetLastHitInfo(FinalImpulseVector, Hit.ImpactPoint);
+    }
+
+    // [데미지 계산]
+    float CalculatedDamage = 0.0f;
     if (MyWeapon)
     {
         CalculatedDamage = ImpactForce * MyWeapon->CurrentWeaponData.DamageCoefficient * MyWeapon->CurrentWeaponData.MassKg * ABaseWeapon::GlobalDamageMultiplier * 0.001f;
     }
     else
     {
-        CalculatedDamage = ImpactForce * 0.001f;
+        // [수정] 맨손 공격 시 기본 데미지 10 추가
+        CalculatedDamage = (ImpactForce * 0.001f) + Global_BasePunchDamage;
     }
 
-    if (CalculatedDamage >= 5.0f)
+    // 디버그 출력
+    if (GEngine)
+    {
+        FString DebugMsg = FString::Printf(TEXT("Hit: %s | Dmg: %.1f | Impulse: %.0f"),
+            *OtherActor->GetName(), CalculatedDamage, FinalImpulsePower);
+        GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Yellow, DebugMsg);
+
+        ATK_LOG(Log, TEXT("Target: %s, Damage: %.1f, Impulse: %.1f"), *OtherActor->GetName(), CalculatedDamage, FinalImpulsePower);
+    }
+
+    // 유효타 처리
+    if (CalculatedDamage >= 3.0f)
     {
         UGameplayStatics::ApplyDamage(OtherActor, CalculatedDamage, GetOwner()->GetInstigatorController(), GetOwner(), nullptr);
-        if (MyWeapon)
-        {
-            // 무기가 있을 때만 내구도를 감소시킴
-            MyWeapon->DecreaseDurability(CalculatedDamage);
-        }
 
-        GEngine->AddOnScreenDebugMessage(
-            -1,
-            2.f,
-            FColor::Green,
-            FString::Printf(TEXT("데미지 적용 -> 대상: %s, 피해량: %.1f"), *OtherActor->GetName(), CalculatedDamage)
-        );
+        // =======================================================
+        // [수정] 무기 내구도 감소 및 "피격 사운드 재생"
+        // =======================================================
+        if(MyWeapon)
+        {
+            if (Cast<ABaseCharacter>(OtherActor))
+            {
+                MyWeapon->DecreaseDurability(CalculatedDamage);
+
+                // 무기로 때렸을 때 소리 재생
+                if (MyWeapon->CurrentWeaponData.HitSound)
+                {
+                    // [핵심] 3번째 인자로 1.0f (볼륨) 추가!
+                    MulticastPlayHitSound(MyWeapon->CurrentWeaponData.HitSound, Hit.ImpactPoint, 1.0f);
+                }
+            }
+        }
+        else
+        {
+            // 맨손으로 때렸을 때 소리 재생
+            if (OwnerChar && OwnerChar->PunchHitSound)
+            {
+                // [핵심] 3번째 인자로 1.0f (볼륨) 추가!
+                MulticastPlayHitSound(OwnerChar->PunchHitSound, Hit.ImpactPoint, 1.0f);
+            }
+        }
+        // =======================================================
     }
 
-    if (GetOwner()->HasAuthority() && OtherComp)
+    // 공격 성공 시 히트 스탑 적용 (0.1초 멈춤 -> 이후 애니메이션 종료)
+    MulticastApplyHitStop(0.1f);
+
+    if (GetOwner()->HasAuthority())
     {
-        // 타격 방향 계산 (충돌 법선 벡터의 반대 방향)
-        FVector ImpulseDir = -Hit.ImpactNormal;
-        if (ImpulseDir.IsNearlyZero()) ImpulseDir = OwnerChar->GetActorForwardVector();
-
-        // 물리 시뮬레이션 중인 대상 (시체 또는 오브젝트)
-        if (OtherComp->IsSimulatingPhysics())
+        if (ABaseCharacter* VictimChar = Cast<ABaseCharacter>(OtherActor))
         {
-            float ImpulseMultiplier = (MyWeapon) ? (ABaseWeapon::GlobalImpulseMultiplier * MyWeapon->CurrentWeaponData.MassKg * MyWeapon->CurrentWeaponData.ImpulseCoefficient) : 1.0f;
-
-            // 힘이 너무 약하면 최소값을 보장하거나 직접 계산한 힘을 넣습니다.
-            float FinalImpulse = FMath::Max(ImpactForce * ImpulseMultiplier, 500.0f);
-            OtherComp->AddImpulseAtLocation(ImpulseDir * FinalImpulse, Hit.ImpactPoint);
+            // [핵심] 피지컬 애니메이션 흔들림은 멀티캐스트를 통해 모든 화면에서 실행
+            VictimChar->MulticastPlayPhysicalHitReaction(FinalImpulseVector, Hit.ImpactPoint, Hit.BoneName);
+        }
+        // 캐릭터 외 일반 물리 시뮬레이션 물체 처리
+        else if (OtherComp && OtherComp->IsSimulatingPhysics())
+        {
+            // 일반 프롭들도 멀티캐스트로 처리해야 완벽하지만, 기본적으로 Replicate Movement가 켜져 있다면 서버가 밀어냅니다.
+            OtherComp->AddImpulseAtLocation(FinalImpulseVector, Hit.ImpactPoint, Hit.BoneName);
         }
     }
-    ////
-	HitActors.Add(OtherActor);
+
+    HitActors.Add(OtherActor);
 }
 
 float UBRAttackComponent::GetCalculatedAttackSpeed() const
@@ -229,38 +297,17 @@ float UBRAttackComponent::GetCalculatedAttackSpeed() const
 
     float FinalSpeed = 1.0f;
 
-    // 1. 무기가 있는 경우: (표준무게 / 현재무기무게) * 글로벌 배율
     if (OwnerChar->CurrentWeapon)
     {
         float WeaponMass = OwnerChar->CurrentWeapon->CurrentWeaponData.MassKg;
-
-        // 0으로 나누기 방지
         float MassRatio = (WeaponMass > 0.1f) ? (StandardMass / WeaponMass) : 1.0f;
-
-        // 무기 데이터의 속도 계수(Coefficient)가 있다면 여기서 곱해줍니다.
         float WeaponSpeedCoeff = OwnerChar->CurrentWeapon->CurrentWeaponData.AttackSpeedCoefficient;
-
         FinalSpeed = MassRatio * WeaponSpeedCoeff * ABaseWeapon::GlobalAttackSpeedMultiplier;
-
-        //GEngine->AddOnScreenDebugMessage(
-        //    -1,
-        //    2.f,
-        //    FColor::Green,
-        //    FString::Printf(TEXT("Weapon Attack Speed: %.2f (Mass: %.1f, GlobalMult: %.1f)"), FinalSpeed, WeaponMass, ABaseWeapon::GlobalAttackSpeedMultiplier)
-        //);
     }
-    // 2. 맨손인 경우: 글로벌 배율만 적용 (혹은 별도 맨손 계수)
     else
     {
         FinalSpeed = ABaseWeapon::GlobalAttackSpeedMultiplier;
-        //GEngine->AddOnScreenDebugMessage(
-        //    -1,
-        //    2.f,
-        //    FColor::Green,
-        //    FString::Printf(TEXT("Unarmed Attack Speed: %.2f"), FinalSpeed)
-        //);
     }
 
-    // 게임플레이 한계치 설정 (너무 느리거나 빠르면 비현실적)
     return FMath::Clamp(FinalSpeed, 0.5f, 1.5f);
 }
